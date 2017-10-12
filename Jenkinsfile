@@ -1,33 +1,23 @@
 pipeline {
   agent any
   stages {
-    stage('Preparation') {
-      steps {
-        dir(path: 'source') {
-          git url: 'https://github.com/ubports/mir.git', branch: 'xenial'
-        }
-        
-      }
-    }
     stage('Build source') {
       steps {
-        sh 'rm -f ./* || true'
         sh '/usr/bin/build-source.sh'
         stash(name: 'source', includes: '*.gz,*.bz2,*.xz,*.deb,*.dsc,*.changes,*.buildinfo,lintian.txt')
         cleanWs(cleanWhenAborted: true, cleanWhenFailure: true, cleanWhenNotBuilt: true, cleanWhenSuccess: true, cleanWhenUnstable: true, deleteDirs: true)
       }
     }
-    stage('Build binary - armhf') {
+    stage('Build binary - all') {
       steps {
         node(label: 'xenial-arm64') {
           unstash 'source'
-          sh '''export architecture="armhf"
-export BUILD_ONLY=true
-#/usr/bin/build-and-provide-package'''
+          sh '''export architecture="all"
+build-binary.sh'''
           stash(includes: '*.gz,*.bz2,*.xz,*.deb,*.dsc,*.changes,*.buildinfo,lintian.txt', name: 'build')
           cleanWs(cleanWhenAborted: true, cleanWhenFailure: true, cleanWhenNotBuilt: true, cleanWhenSuccess: true, cleanWhenUnstable: true, deleteDirs: true)
         }
-        
+
       }
     }
     stage('Results') {
@@ -35,7 +25,7 @@ export BUILD_ONLY=true
         unstash 'build'
         archiveArtifacts(artifacts: '*.gz,*.bz2,*.xz,*.deb,*.dsc,*.changes,*.buildinfo', fingerprint: true, onlyIfSuccessful: true)
         sh '''export architecture="armhf"
-#/usr/bin/build-repo.sh'''
+/usr/bin/build-repo.sh'''
       }
     }
     stage('Cleanup') {
