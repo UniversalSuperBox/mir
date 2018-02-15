@@ -32,6 +32,7 @@ namespace mir
 namespace input
 {
 class InputDeviceHub;
+class Seat;
 }
 namespace graphics
 {
@@ -44,12 +45,14 @@ namespace frontend
 class WlCompositor;
 class WlApplication;
 class WlShell;
+class XdgShellV6;
 class WlSeat;
 class OutputManager;
 
 class Shell;
 class DisplayChanger;
 class SessionAuthorizer;
+class DataDeviceManager;
 
 class WaylandConnector : public Connector
 {
@@ -59,6 +62,7 @@ public:
         std::shared_ptr<Shell> const& shell,
         DisplayChanger& display_config,
         std::shared_ptr<input::InputDeviceHub> const& input_hub,
+        std::shared_ptr<input::Seat> const& seat,
         std::shared_ptr<graphics::GraphicBufferAllocator> const& allocator,
         std::shared_ptr<SessionAuthorizer> const& session_authorizer,
         bool arw_socket);
@@ -82,6 +86,8 @@ private:
     std::unique_ptr<OutputManager> output_manager;
     std::shared_ptr<graphics::WaylandAllocator> const allocator;
     std::unique_ptr<WlShell> shell_global;
+    std::unique_ptr<DataDeviceManager> data_device_manager_global;
+    std::unique_ptr<XdgShellV6> xdg_shell_global;
     std::thread dispatch_thread;
     wl_event_source* pause_source;
 };

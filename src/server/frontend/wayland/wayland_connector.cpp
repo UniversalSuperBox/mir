@@ -1,5 +1,5 @@
 /*
- * Copyright © 2015 Canonical Ltd.
+ * Copyright © 2015-2018 Canonical Ltd.
  *
  * This program is free software: you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 3,
@@ -18,7 +18,14 @@
 
 #include "wayland_connector.h"
 
+#include "basic_surface_event_sink.h"
+#include "null_event_sink.h"
+#include "output_manager.h"
+#include "wayland_executor.h"
+#include "wlshmbuffer.h"
+
 #include "core_generated_interfaces.h"
+#include "xdg_shell_generated_interfaces.h"
 
 #include "mir/frontend/shell.h"
 #include "mir/frontend/surface.h"
@@ -28,23 +35,20 @@
 #include "mir/compositor/buffer_stream.h"
 
 #include "mir/frontend/session.h"
-#include "mir/frontend/event_sink.h"
 #include "mir/scene/surface_creation_parameters.h"
+#include "mir/scene/surface.h"
 
 #include "mir/graphics/buffer_properties.h"
 #include "mir/graphics/buffer.h"
-#include "mir/graphics/display_configuration.h"
 #include "mir/graphics/graphic_buffer_allocator.h"
 #include "mir/graphics/wayland_allocator.h"
 
 #include "mir/renderer/gl/texture_target.h"
 #include "mir/frontend/buffer_stream_id.h"
-#include "mir/frontend/display_changer.h"
-
-#include "mir/executor.h"
 
 #include "mir/client/event.h"
 
+#include "mir/input/seat.h"
 #include "mir/input/device.h"
 #include "mir/input/mir_keyboard_config.h"
 #include "mir/input/input_device_hub.h"
@@ -56,25 +60,19 @@
 #include <unordered_map>
 #include <boost/throw_exception.hpp>
 
-#include <future>
 #include <functional>
 #include <type_traits>
 
 #include <xkbcommon/xkbcommon.h>
 #include <linux/input.h>
-#include <algorithm>
-#include <iostream>
 #include <mir/log.h>
 #include <cstring>
-#include <deque>
-#include MIR_SERVER_GL_H
-#include MIR_SERVER_GLEXT_H
 
 #include "mir/fd.h"
-#include "../../../platforms/common/server/shm_buffer.h"
 
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <unordered_set>
 #include "mir/anonymous_shm_file.h"
 
 namespace mf = mir::frontend;
@@ -89,89 +87,13 @@ namespace mir
 {
 namespace frontend
 {
-
-class WaylandEventSink : public mf::EventSink
-{
-public:
-    WaylandEventSink(std::function<void(MirLifecycleState)> const& lifecycle_handler)
-        : lifecycle_handler{lifecycle_handler}
-    {
-    }
-
-    void handle_event(const MirEvent& e) override;
-    void handle_lifecycle_event(MirLifecycleState state) override;
-    void handle_display_config_change(graphics::DisplayConfiguration const& config) override;
-    void send_ping(int32_t serial) override;
-    void send_buffer(BufferStreamId id, graphics::Buffer& buffer, graphics::BufferIpcMsgType type) override;
-    void handle_input_config_change(MirInputConfig const&) override {}
-    void handle_error(ClientVisibleError const&) override {}
-
-    void add_buffer(graphics::Buffer&) override {}
-    void error_buffer(geometry::Size, MirPixelFormat, std::string const& ) override {}
-    void update_buffer(graphics::Buffer&) override {}
-
-private:
-    std::function<void(MirLifecycleState)> const lifecycle_handler;
-};
-
 namespace
 {
-bool get_gl_pixel_format(
-    MirPixelFormat mir_format,
-    GLenum& gl_format,
-    GLenum& gl_type)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-    GLenum const argb = GL_BGRA_EXT;
-    GLenum const abgr = GL_RGBA;
-#elif __BYTE_ORDER == __BIG_ENDIAN
-    // TODO: Big endian support
-GLenum const argb = GL_INVALID_ENUM;
-GLenum const abgr = GL_INVALID_ENUM;
-//GLenum const rgba = GL_RGBA;
-//GLenum const bgra = GL_BGRA_EXT;
-#endif
-
-    static const struct
-    {
-        MirPixelFormat mir_format;
-        GLenum gl_format, gl_type;
-    } mapping[mir_pixel_formats] =
-        {
-            {mir_pixel_format_invalid,   GL_INVALID_ENUM, GL_INVALID_ENUM},
-            {mir_pixel_format_abgr_8888, abgr,            GL_UNSIGNED_BYTE},
-            {mir_pixel_format_xbgr_8888, abgr,            GL_UNSIGNED_BYTE},
-            {mir_pixel_format_argb_8888, argb,            GL_UNSIGNED_BYTE},
-            {mir_pixel_format_xrgb_8888, argb,            GL_UNSIGNED_BYTE},
-            {mir_pixel_format_bgr_888,   GL_INVALID_ENUM, GL_INVALID_ENUM},
-            {mir_pixel_format_rgb_888,   GL_RGB,          GL_UNSIGNED_BYTE},
-            {mir_pixel_format_rgb_565,   GL_RGB,          GL_UNSIGNED_SHORT_5_6_5},
-            {mir_pixel_format_rgba_5551, GL_RGBA,         GL_UNSIGNED_SHORT_5_5_5_1},
-            {mir_pixel_format_rgba_4444, GL_RGBA,         GL_UNSIGNED_SHORT_4_4_4_4},
-        };
-
-    if (mir_format > mir_pixel_format_invalid &&
-        mir_format < mir_pixel_formats &&
-        mapping[mir_format].mir_format == mir_format) // just a sanity check
-    {
-        gl_format = mapping[mir_format].gl_format;
-        gl_type = mapping[mir_format].gl_type;
-    }
-    else
-    {
-        gl_format = GL_INVALID_ENUM;
-        gl_type = GL_INVALID_ENUM;
-    }
-
-    return gl_format != GL_INVALID_ENUM && gl_type != GL_INVALID_ENUM;
-}
-
-
 struct ClientPrivate
 {
-    ClientPrivate(std::shared_ptr<mf::Session> const& session, mf::Shell& shell)
+    ClientPrivate(std::shared_ptr<mf::Session> const& session, mf::Shell* shell)
         : session{session},
-          shell{&shell}
+          shell{shell}
     {
     }
 
@@ -220,6 +142,11 @@ std::shared_ptr<mf::Session> session_for_client(wl_client* client)
     return nullptr;
 }
 
+std::shared_ptr<ms::Surface> get_surface_for_id(std::shared_ptr<mf::Session> const& session, mf::SurfaceId surface_id)
+{
+    return std::dynamic_pointer_cast<ms::Surface>(session->get_surface(surface_id));
+}
+
 struct ClientSessionConstructor
 {
     ClientSessionConstructor(std::shared_ptr<mf::Shell> const& shell,
@@ -257,16 +184,16 @@ void create_client_session(wl_listener* listener, void* data)
                                                    client_uid, client_gid};
     if (!construction_context->session_authorizer->connection_is_allowed(*session_cred))
     {
-      wl_client_destroy(client);
-      return;
+        wl_client_destroy(client);
+        return;
     }
 
     auto session = construction_context->shell->open_session(
         client_pid,
         "",
-        std::make_shared<WaylandEventSink>([](auto){}));
+        std::make_shared<NullEventSink>());
 
-    auto client_context = new ClientPrivate{session, *construction_context->shell};
+    auto client_context = new ClientPrivate{session, construction_context->shell.get()};
     client_context->destroy_listener.notify = &cleanup_private;
     wl_client_add_destroy_listener(client, &client_context->destroy_listener);
 }
@@ -304,44 +231,6 @@ std::shared_ptr<mf::BufferStream> create_buffer_stream(mf::Session& session)
     return session.get_buffer_stream(id);
 }
 */
-MirPixelFormat wl_format_to_mir_format(uint32_t format)
-{
-    switch (format)
-    {
-        case WL_SHM_FORMAT_ARGB8888:
-            return mir_pixel_format_argb_8888;
-        case WL_SHM_FORMAT_XRGB8888:
-            return mir_pixel_format_xrgb_8888;
-        case WL_SHM_FORMAT_RGBA4444:
-            return mir_pixel_format_rgba_4444;
-        case WL_SHM_FORMAT_RGBA5551:
-            return mir_pixel_format_rgba_5551;
-        case WL_SHM_FORMAT_RGB565:
-            return mir_pixel_format_rgb_565;
-        case WL_SHM_FORMAT_RGB888:
-            return mir_pixel_format_rgb_888;
-        case WL_SHM_FORMAT_BGR888:
-            return mir_pixel_format_bgr_888;
-        case WL_SHM_FORMAT_XBGR8888:
-            return mir_pixel_format_xbgr_8888;
-        case WL_SHM_FORMAT_ABGR8888:
-            return mir_pixel_format_abgr_8888;
-        default:
-            return mir_pixel_format_invalid;
-    }
-}
-
-wl_shm_buffer* shm_buffer_from_resource_checked(wl_resource* resource)
-{
-    auto const buffer = wl_shm_buffer_get(resource);
-    if (!buffer)
-    {
-        BOOST_THROW_EXCEPTION((std::logic_error{"Tried to create WlShmBuffer from non-shm resource"}));
-    }
-
-    return buffer;
-}
-
 template<typename Callable>
 auto run_unless(std::shared_ptr<bool> const& condition, Callable&& callable)
 {
@@ -356,222 +245,22 @@ auto run_unless(std::shared_ptr<bool> const& condition, Callable&& callable)
 }
 }
 
-class WlShmBuffer :
-    public mg::BufferBasic,
-    public mg::NativeBufferBase,
-    public mir::renderer::gl::TextureSource,
-    public mir::renderer::software::PixelSource
+struct WlMirWindow
 {
-public:
-    ~WlShmBuffer()
-    {
-        std::lock_guard<std::mutex> lock{*buffer_mutex};
-        if (buffer)
-        {
-            wl_resource_queue_event(resource, WL_BUFFER_RELEASE);
-        }
-    }
-
-    static std::shared_ptr<graphics::Buffer> mir_buffer_from_wl_buffer(
-        wl_resource* buffer,
-        std::function<void()>&& on_consumed)
-    {
-        std::shared_ptr<WlShmBuffer> mir_buffer;
-        DestructionShim* shim;
-
-        if (auto notifier = wl_resource_get_destroy_listener(buffer, &on_buffer_destroyed))
-        {
-            // We've already constructed a shim for this buffer, update it.
-            shim = wl_container_of(notifier, shim, destruction_listener);
-
-            if (!(mir_buffer = shim->associated_buffer.lock()))
-            {
-                /*
-                 * We've seen this wl_buffer before, but all the WlShmBuffers associated with it
-                 * have been destroyed.
-                 *
-                 * Recreate a new WlShmBuffer to track the new compositor lifetime.
-                 */
-                mir_buffer = std::shared_ptr<WlShmBuffer>{new WlShmBuffer{buffer, std::move(on_consumed)}};
-                shim->associated_buffer = mir_buffer;
-            }
-        }
-        else
-        {
-            mir_buffer = std::shared_ptr<WlShmBuffer>{new WlShmBuffer{buffer, std::move(on_consumed)}};
-            shim = new DestructionShim;
-            shim->destruction_listener.notify = &on_buffer_destroyed;
-            shim->associated_buffer = mir_buffer;
-
-            wl_resource_add_destroy_listener(buffer, &shim->destruction_listener);
-        }
-
-        mir_buffer->buffer_mutex = shim->mutex;
-        return mir_buffer;
-    }
-
-    std::shared_ptr<graphics::NativeBuffer> native_buffer_handle() const override
-    {
-        return nullptr;
-    }
-
-    geometry::Size size() const override
-    {
-        return size_;
-    }
-
-    MirPixelFormat pixel_format() const override
-    {
-        return format_;
-    }
-
-    graphics::NativeBufferBase *native_buffer_base() override
-    {
-        return this;
-    }
-
-    void gl_bind_to_texture() override
-    {
-        GLenum format, type;
-
-        if (get_gl_pixel_format(
-            format_,
-            format,
-            type))
-        {
-            /*
-             * All existing Mir logic assumes that strides are whole multiples of
-             * pixels. And OpenGL defaults to expecting strides are multiples of
-             * 4 bytes. These assumptions used to be compatible when we only had
-             * 4-byte pixels but now we support 2/3-byte pixels we need to be more
-             * careful...
-             */
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-            read(
-               [this, format, type](unsigned char const* pixels)
-               {
-                   auto const size = this->size();
-                   glTexImage2D(GL_TEXTURE_2D, 0, format,
-                                size.width.as_int(), size.height.as_int(),
-                                0, format, type, pixels);
-               });
-        }
-    }
-
-    void bind() override
-    {
-        gl_bind_to_texture();
-    }
-
-    void secure_for_render() override
-    {
-    }
-
-    void write(unsigned char const *pixels, size_t size) override
-    {
-        std::lock_guard<std::mutex> lock{*buffer_mutex};
-        wl_shm_buffer_begin_access(buffer);
-        auto data = wl_shm_buffer_get_data(buffer);
-        ::memcpy(data, pixels, size);
-        wl_shm_buffer_end_access(buffer);
-    }
-
-    void read(std::function<void(unsigned char const *)> const &do_with_pixels) override
-    {
-        std::lock_guard<std::mutex> lock{*buffer_mutex};
-        if (!buffer)
-        {
-            mir::log_warning("Attempt to read from WlShmBuffer after the wl_buffer has been destroyed");
-            return;
-        }
-
-        if (!consumed)
-        {
-            on_consumed();
-            consumed = true;
-        }
-
-        do_with_pixels(static_cast<unsigned char const*>(data.get()));
-    }
-
-    geometry::Stride stride() const override
-    {
-        return stride_;
-    }
-
-private:
-    WlShmBuffer(
-        wl_resource* buffer,
-        std::function<void()>&& on_consumed)
-        : buffer{shm_buffer_from_resource_checked(buffer)},
-          resource{buffer},
-          size_{wl_shm_buffer_get_width(this->buffer), wl_shm_buffer_get_height(this->buffer)},
-          stride_{wl_shm_buffer_get_stride(this->buffer)},
-          format_{wl_format_to_mir_format(wl_shm_buffer_get_format(this->buffer))},
-          data{std::make_unique<uint8_t[]>(size_.height.as_int() * stride_.as_int())},
-          consumed{false},
-          on_consumed{std::move(on_consumed)}
-    {
-        if (stride_.as_int() < size_.width.as_int() * MIR_BYTES_PER_PIXEL(format_))
-        {
-            wl_resource_post_error(
-                resource,
-                WL_SHM_ERROR_INVALID_STRIDE,
-                "Stride (%u) is less than width × bytes per pixel (%u×%u). "
-                "Did you accidentally specify stride in pixels?",
-                stride_.as_int(), size_.width.as_int(), MIR_BYTES_PER_PIXEL(format_));
-
-            BOOST_THROW_EXCEPTION((
-                std::runtime_error{"Buffer has invalid stride"}));
-        }
-
-        wl_shm_buffer_begin_access(this->buffer);
-        std::memcpy(data.get(), wl_shm_buffer_get_data(this->buffer), size_.height.as_int() * stride_.as_int());
-        wl_shm_buffer_end_access(this->buffer);
-    }
-
-    static void on_buffer_destroyed(wl_listener* listener, void*)
-    {
-        static_assert(
-            std::is_standard_layout<DestructionShim>::value,
-            "DestructionShim must be Standard Layout for wl_container_of to be defined behaviour");
-
-        DestructionShim* shim;
-        shim = wl_container_of(listener, shim, destruction_listener);
-
-        {
-            std::lock_guard<std::mutex> lock{*shim->mutex};
-            if (auto mir_buffer = shim->associated_buffer.lock())
-            {
-                mir_buffer->buffer = nullptr;
-            }
-        }
-
-        delete shim;
-    }
-
-    struct DestructionShim
-    {
-        std::shared_ptr<std::mutex> const mutex = std::make_shared<std::mutex>();
-        std::weak_ptr<WlShmBuffer> associated_buffer;
-        wl_listener destruction_listener;
-    };
-
-    std::shared_ptr<std::mutex> buffer_mutex;
-
-    wl_shm_buffer* buffer;
-    wl_resource* const resource;
-
-    geom::Size const size_;
-    geom::Stride const stride_;
-    MirPixelFormat const format_;
-
-    std::unique_ptr<uint8_t[]> const data;
-
-    bool consumed;
-    std::function<void()> on_consumed;
+    virtual void new_buffer_size(geometry::Size const& buffer_size) = 0;
+    virtual void commit() = 0;
+    virtual void visiblity(bool visible) = 0;
+    virtual void destroy() = 0;
+    virtual ~WlMirWindow() = default;
 };
+
+struct NullWlMirWindow : WlMirWindow
+{
+    void new_buffer_size(geom::Size const& ) {}
+    void commit() {}
+    void visiblity(bool ) {}
+    void destroy() {}
+} nullwlmirwindow;
 
 class WlSurface : public wayland::Surface
 {
@@ -610,24 +299,25 @@ public:
             session->destroy_buffer_stream(stream_id);
     }
 
-    void set_resize_handler(std::function<void(geom::Size)> const& handler)
+    void set_role(WlMirWindow* role_)
     {
-        resize_handler = handler;
-    }
-
-    void set_hide_handler(std::function<void()> const& handler)
-    {
-        hide_handler = handler;
+        role = role_;
     }
 
     mf::BufferStreamId stream_id;
     std::shared_ptr<mf::BufferStream> stream;
+    mf::SurfaceId surface_id;       // ID of any associated surface
+
+    std::shared_ptr<bool> destroyed_flag() const
+    {
+        return destroyed;
+    }
+
 private:
     std::shared_ptr<mg::WaylandAllocator> const allocator;
     std::shared_ptr<mir::Executor> const executor;
 
-    std::function<void(geom::Size)> resize_handler;
-    std::function<void()> hide_handler;
+    WlMirWindow* role = &nullwlmirwindow;
 
     wl_resource* pending_buffer;
     std::shared_ptr<std::vector<wl_resource*>> const pending_frames;
@@ -645,8 +335,16 @@ private:
     void set_buffer_scale(int32_t scale);
 };
 
+WlSurface* get_wlsurface(wl_resource* surface)
+{
+    auto* tmp = wl_resource_get_user_data(surface);
+    return static_cast<WlSurface*>(static_cast<wayland::Surface*>(tmp));
+}
+
 void WlSurface::destroy()
 {
+    *destroyed = true;
+    role->destroy();
     wl_resource_destroy(resource);
 }
 
@@ -657,12 +355,9 @@ void WlSurface::attach(std::experimental::optional<wl_resource*> const& buffer, 
         mir::log_warning("Client requested unimplemented non-zero attach offset. Rendering will be incorrect.");
     }
 
-    if(!buffer && hide_handler)
-    {
-        hide_handler();
-    }
+    role->visiblity(!!buffer);
 
-    pending_buffer = *buffer;
+    pending_buffer = buffer.value_or(nullptr);
 }
 
 void WlSurface::damage(int32_t x, int32_t y, int32_t width, int32_t height)
@@ -671,6 +366,7 @@ void WlSurface::damage(int32_t x, int32_t y, int32_t width, int32_t height)
     (void)y;
     (void)width;
     (void)height;
+    // This isn't essential, but could enable optimizations
 }
 
 void WlSurface::damage_buffer(int32_t x, int32_t y, int32_t width, int32_t height)
@@ -679,6 +375,7 @@ void WlSurface::damage_buffer(int32_t x, int32_t y, int32_t width, int32_t heigh
     (void)y;
     (void)width;
     (void)height;
+    // This isn't essential, but could enable optimizations
 }
 
 void WlSurface::frame(uint32_t callback)
@@ -763,24 +460,28 @@ void WlSurface::commit()
          * TODO: Provide a mg::Buffer::logical_size() to do this properly.
          */
         stream->resize(mir_buffer->size());
-        if (resize_handler)
-        {
-            resize_handler(mir_buffer->size());
-        }
+        role->new_buffer_size(mir_buffer->size());
+        role->commit();
         stream->submit_buffer(mir_buffer);
 
         pending_buffer = nullptr;
+    }
+    else
+    {
+        role->commit();
     }
 }
 
 void WlSurface::set_buffer_transform(int32_t transform)
 {
     (void)transform;
+    // TODO
 }
 
 void WlSurface::set_buffer_scale(int32_t scale)
 {
     (void)scale;
+    // TODO
 }
 
 class WlCompositor : public wayland::Compositor
@@ -847,6 +548,7 @@ public:
         uint32_t id,
         mir::input::Keymap const& initial_keymap,
         std::function<void(WlKeyboard*)> const& on_destroy,
+        std::function<std::vector<uint32_t>()> const& acquire_current_keyboard_state,
         std::shared_ptr<mir::Executor> const& executor)
         : Keyboard(client, parent, id),
           keymap{nullptr, &xkb_keymap_unref},
@@ -854,6 +556,7 @@ public:
           context{xkb_context_new(XKB_CONTEXT_NO_FLAGS), &xkb_context_unref},
           executor{executor},
           on_destroy{on_destroy},
+          acquire_current_keyboard_state{acquire_current_keyboard_state},
           destroyed{std::make_shared<bool>(false)}
     {
         // TODO: We should really grab the keymap for the focused surface when
@@ -914,38 +617,7 @@ public:
                     default:
                         break;
                 }
-
-                auto new_depressed_mods = xkb_state_serialize_mods(
-                    state.get(),
-                    XKB_STATE_MODS_DEPRESSED);
-                auto new_latched_mods = xkb_state_serialize_mods(
-                    state.get(),
-                    XKB_STATE_MODS_LATCHED);
-                auto new_locked_mods = xkb_state_serialize_mods(
-                    state.get(),
-                    XKB_STATE_MODS_LOCKED);
-                auto new_group = xkb_state_serialize_layout(
-                    state.get(),
-                    XKB_STATE_LAYOUT_EFFECTIVE);
-
-                if ((new_depressed_mods != mods_depressed) ||
-                    (new_latched_mods != mods_latched) ||
-                    (new_locked_mods != mods_locked) ||
-                    (new_group != group))
-                {
-                    mods_depressed = new_depressed_mods;
-                    mods_latched = new_latched_mods;
-                    mods_locked = new_locked_mods;
-                    group = new_group;
-
-                    wl_keyboard_send_modifiers(
-                        resource,
-                        wl_display_get_serial(wl_client_get_display(client)),
-                        mods_depressed,
-                        mods_latched,
-                        mods_locked,
-                        group);
-                }
+                update_modifier_state();
             }));
     }
 
@@ -957,20 +629,47 @@ public:
                 destroyed,
                 [
                     target = target,
+                    target_window_destroyed = get_wlsurface(target)->destroyed_flag(),
                     focussed = mir_window_event_get_attribute_value(event),
                     this
                 ]()
                 {
+                    if (*target_window_destroyed)
+                        return;
+
                     auto const serial = wl_display_next_serial(wl_client_get_display(client));
                     if (focussed)
                     {
                         /*
                          * TODO:
-                         *  *) Send the actual modifier state here.
                          *  *) Send the surface's keymap here.
                          */
+                        auto const keyboard_state = acquire_current_keyboard_state();
+
                         wl_array key_state;
                         wl_array_init(&key_state);
+
+                        auto* const array_storage = wl_array_add(
+                            &key_state,
+                            keyboard_state.size() * sizeof(decltype(keyboard_state)::value_type));
+                        if (!array_storage)
+                        {
+                            wl_resource_post_no_memory(resource);
+                            BOOST_THROW_EXCEPTION(std::bad_alloc());
+                        }
+                        std::memcpy(
+                            array_storage,
+                            keyboard_state.data(),
+                            keyboard_state.size() * sizeof(decltype(keyboard_state)::value_type));
+
+                        // Rebuild xkb state
+                        state = decltype(state)(xkb_state_new(keymap.get()), &xkb_state_unref);
+                        for (auto scancode : keyboard_state)
+                        {
+                            xkb_state_update_key(state.get(), scancode + 8, XKB_KEY_DOWN);
+                        }
+                        update_modifier_state();
+
                         wl_keyboard_send_enter(resource, serial, target, &key_state);
                         wl_array_release(&key_state);
                     }
@@ -1042,12 +741,51 @@ public:
     }
 
 private:
+    void update_modifier_state()
+    {
+        // TODO?
+        // assert_on_wayland_event_loop()
+
+        auto new_depressed_mods = xkb_state_serialize_mods(
+            state.get(),
+            XKB_STATE_MODS_DEPRESSED);
+        auto new_latched_mods = xkb_state_serialize_mods(
+            state.get(),
+            XKB_STATE_MODS_LATCHED);
+        auto new_locked_mods = xkb_state_serialize_mods(
+            state.get(),
+            XKB_STATE_MODS_LOCKED);
+        auto new_group = xkb_state_serialize_layout(
+            state.get(),
+            XKB_STATE_LAYOUT_EFFECTIVE);
+
+        if ((new_depressed_mods != mods_depressed) ||
+            (new_latched_mods != mods_latched) ||
+            (new_locked_mods != mods_locked) ||
+            (new_group != group))
+        {
+            mods_depressed = new_depressed_mods;
+            mods_latched = new_latched_mods;
+            mods_locked = new_locked_mods;
+            group = new_group;
+
+            wl_keyboard_send_modifiers(
+                resource,
+                wl_display_get_serial(wl_client_get_display(client)),
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group);
+        }
+    }
+
     std::unique_ptr<xkb_keymap, decltype(&xkb_keymap_unref)> keymap;
     std::unique_ptr<xkb_state, decltype(&xkb_state_unref)> state;
     std::unique_ptr<xkb_context, decltype(&xkb_context_unref)> const context;
 
     std::shared_ptr<mir::Executor> const executor;
     std::function<void(WlKeyboard*)> on_destroy;
+    std::function<std::vector<uint32_t>()> const acquire_current_keyboard_state;
     std::shared_ptr<bool> const destroyed;
 
     uint32_t mods_depressed{0};
@@ -1083,16 +821,24 @@ public:
 
     ~WlPointer()
     {
-        on_destroy(this);
         *destroyed = true;
+        on_destroy(this);
     }
 
     void handle_event(MirInputEvent const* event, wl_resource* target)
     {
         executor->spawn(run_unless(
             destroyed,
-            [ev = mcl::Event{mir_input_event_get_event(event)}, target, this]()
+            [
+                ev = mcl::Event{mir_input_event_get_event(event)},
+                target,
+                target_window_destroyed = get_wlsurface(target)->destroyed_flag(),
+                this
+            ]()
             {
+                if (*target_window_destroyed)
+                    return;
+
                 auto const serial = wl_display_next_serial(display);
                 auto const event = mir_event_get_input_event(ev);
                 auto const pointer_event = mir_input_event_get_pointer_event(event);
@@ -1246,8 +992,16 @@ public:
     {
         executor->spawn(run_unless(
             destroyed,
-            [ev = mcl::Event{mir_input_event_get_event(event)}, target = target, this]()
+            [
+                ev = mcl::Event{mir_input_event_get_event(event)},
+                target = target,
+                target_window_destroyed = get_wlsurface(target)->destroyed_flag(),
+                this
+            ]()
             {
+                if (*target_window_destroyed)
+                    return;
+
                 auto const input_ev = mir_event_get_input_event(ev);
                 auto const touch_ev = mir_input_event_get_touch_event(input_ev);
 
@@ -1392,12 +1146,13 @@ private:
     std::vector<InputInterface*> listeners;
 };
 
-class WlSeat
+class WlSeat : public BasicWlSeat
 {
 public:
     WlSeat(
         wl_display* display,
         std::shared_ptr<mi::InputDeviceHub> const& input_hub,
+        std::shared_ptr<mi::Seat> const& seat,
         std::shared_ptr<mir::Executor> const& executor)
         : config_observer{
               std::make_shared<ConfigObserver>(
@@ -1405,9 +1160,9 @@ public:
                   [this](mir::input::Keymap const& new_keymap)
                   {
                       keymap = new_keymap;
-
                   })},
           input_hub{input_hub},
+          seat{seat},
           executor{executor},
           global{wl_global_create(
               display,
@@ -1429,11 +1184,13 @@ public:
         wl_global_destroy(global);
     }
 
-    InputCtx<WlPointer> const& acquire_pointer_reference(wl_client* client) const;
-    InputCtx<WlKeyboard> const& acquire_keyboard_reference(wl_client* client) const;
-    InputCtx<WlTouch> const& acquire_touch_reference(wl_client* client) const;
+    void handle_pointer_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const override;
+    void handle_keyboard_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const override;
+    void handle_touch_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const override;
+    void handle_event(wl_client* client, MirKeymapEvent const* keymap_event, wl_resource* target) const override;
+    void handle_event(wl_client* client, MirWindowEvent const* window_event, wl_resource* target) const override;
 
-    void spawn(std::function<void()>&& work)
+    void spawn(std::function<void()>&& work) override
     {
         executor->spawn(std::move(work));
     }
@@ -1469,6 +1226,7 @@ private:
     std::unordered_map<wl_client*, InputCtx<WlTouch>> mutable touch;
 
     std::shared_ptr<mi::InputDeviceHub> const input_hub;
+    std::shared_ptr<mi::Seat> const seat;
 
 
     std::shared_ptr<mir::Executor> const executor;
@@ -1536,6 +1294,32 @@ private:
                 {
                     input_ctx.unregister_listener(listener);
                 },
+                [me]()
+                {
+                    std::unordered_set<uint32_t> pressed_keys;
+
+                    auto const ev = me->seat->create_device_state();
+                    auto const state_event = mir_event_get_input_device_state_event(ev.get());
+                    for (
+                        auto dev = 0u;
+                        dev < mir_input_device_state_event_device_count(state_event);
+                        ++dev)
+                    {
+                        for (
+                            auto idx = 0u;
+                            idx < mir_input_device_state_event_device_pressed_keys_count(state_event, dev);
+                            ++idx)
+                        {
+                            pressed_keys.insert(
+                                mir_input_device_state_event_device_pressed_keys_for_index(
+                                    state_event,
+                                    dev,
+                                    idx));
+                        }
+                    }
+
+                    return std::vector<uint32_t>{pressed_keys.begin(), pressed_keys.end()};
+                },
                 me->executor});
     }
     static void get_touch(wl_client* client, wl_resource* resource, uint32_t id)
@@ -1570,19 +1354,29 @@ struct wl_seat_interface const WlSeat::vtable = {
     WlSeat::release
 };
 
-InputCtx<WlKeyboard> const& WlSeat::acquire_keyboard_reference(wl_client* client) const
+void WlSeat::handle_pointer_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const
 {
-    return keyboard[client];
+    pointer[client].handle_event(input_event, target);
 }
 
-InputCtx<WlPointer> const& WlSeat::acquire_pointer_reference(wl_client* client) const
+void WlSeat::handle_keyboard_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const
 {
-    return pointer[client];
+    keyboard[client].handle_event(input_event, target);
 }
 
-InputCtx<WlTouch> const& WlSeat::acquire_touch_reference(wl_client* client) const
+void WlSeat::handle_touch_event(wl_client* client, MirInputEvent const* input_event, wl_resource* target) const
 {
-    return touch[client];
+    touch[client].handle_event(input_event, target);
+}
+
+void WlSeat::handle_event(wl_client* client, MirKeymapEvent const* keymap_event, wl_resource* target) const
+{
+    keyboard[client].handle_event(keymap_event, target);
+}
+
+void WlSeat::handle_event(wl_client* client, MirWindowEvent const* window_event, wl_resource* target) const
+{
+    keyboard[client].handle_event(window_event, target);
 }
 
 void WlSeat::ConfigObserver::device_added(std::shared_ptr<input::Device> const& device)
@@ -1616,274 +1410,151 @@ void WlSeat::ConfigObserver::changes_complete()
     on_keymap_commit(pending_keymap);
 }
 
-void WaylandEventSink::send_buffer(BufferStreamId /*id*/, graphics::Buffer& /*buffer*/, graphics::BufferIpcMsgType)
-{
-}
-
-void WaylandEventSink::handle_event(MirEvent const& e)
-{
-    switch(mir_event_get_type(&e))
-    {
-    default:
-        // Do nothing
-        break;
-    }
-}
-
-void WaylandEventSink::handle_lifecycle_event(MirLifecycleState state)
-{
-    lifecycle_handler(state);
-}
-
-void WaylandEventSink::handle_display_config_change(graphics::DisplayConfiguration const& /*config*/)
-{
-}
-
-void WaylandEventSink::send_ping(int32_t)
-{
-}
-
-class SurfaceEventSink : public mf::EventSink
+class SurfaceEventSink : public BasicSurfaceEventSink
 {
 public:
-    SurfaceEventSink(WlSeat* seat, wl_client* client, wl_resource* target, wl_resource* event_sink)
-        : seat{seat},
-          client{client},
-          target{target},
-          event_sink{event_sink},
-          window_size{geometry::Size{0,0}}
+    SurfaceEventSink(WlSeat* seat, wl_client* client, wl_resource* target, wl_resource* event_sink,
+        std::shared_ptr<bool> const& destroyed) :
+        BasicSurfaceEventSink{seat, client, target, event_sink},
+        destroyed{destroyed}
     {
     }
 
-    void handle_event(MirEvent const& e) override;
-    void handle_lifecycle_event(MirLifecycleState) override {}
-    void handle_display_config_change(graphics::DisplayConfiguration const&) override {}
-    void send_ping(int32_t) override {}
-    void handle_input_config_change(MirInputConfig const&) override {}
-    void handle_error(ClientVisibleError const&) override {}
-
-    void send_buffer(frontend::BufferStreamId, graphics::Buffer&, graphics::BufferIpcMsgType) override {}
-    void add_buffer(graphics::Buffer&) override {}
-    void error_buffer(geometry::Size, MirPixelFormat, std::string const& ) override {}
-    void update_buffer(graphics::Buffer&) override {}
-
-    void latest_resize(geometry::Size window_size)
-    {
-        this->window_size = window_size;
-    }
+    void send_resize(geometry::Size const& new_size) const override;
 
 private:
-    WlSeat* const seat;
-    wl_client* const client;
-    wl_resource* const target;
-    wl_resource* const event_sink;
-    std::atomic<geometry::Size> window_size;
+    std::shared_ptr<bool> const destroyed;
 };
 
-void SurfaceEventSink::handle_event(MirEvent const& event)
+void SurfaceEventSink::send_resize(geometry::Size const& new_size) const
 {
-    switch (mir_event_get_type(&event))
+    if (window_size != new_size)
     {
-    case mir_event_type_resize:
-    {
-        auto resize = mir_event_get_resize_event(&event);
-        geometry::Size new_size{mir_resize_event_get_width(resize), mir_resize_event_get_height(resize)};
-        if (window_size != new_size)
-        {
-            seat->spawn([event_sink=event_sink,
-                         width = mir_resize_event_get_width(resize),
-                         height = mir_resize_event_get_height(resize)]()
-                {
-                    wl_shell_surface_send_configure(event_sink, WL_SHELL_SURFACE_RESIZE_NONE, width, height);
-                });
-        }
-        break;
-    }
-    case mir_event_type_input:
-    {
-        auto input_event = mir_event_get_input_event(&event);
-        switch (mir_input_event_get_type(input_event))
-        {
-        case mir_input_event_type_key:
-            seat->acquire_keyboard_reference(client).handle_event(input_event, target);
-            break;
-        case mir_input_event_type_pointer:
-            seat->acquire_pointer_reference(client).handle_event(input_event, target);
-            break;
-        case mir_input_event_type_touch:
-            seat->acquire_touch_reference(client).handle_event(input_event, target);
-            break;
-        default:
-            break;
-        }
-        break;
-    }
-    case mir_event_type_keymap:
-    {
-        auto const map_ev = mir_event_get_keymap_event(&event);
-
-        seat->acquire_keyboard_reference(client).handle_event(map_ev, target);
-        break;
-    }
-    case mir_event_type_window:
-    {
-        auto const wev = mir_event_get_window_event(&event);
-
-        seat->acquire_keyboard_reference(client).handle_event(wev, target);
-    }
-    default:
-        break;
+        seat->spawn(run_unless(
+            destroyed,
+            [event_sink= event_sink, width = new_size.width.as_int(), height = new_size.height.as_int()]()
+            {
+                wl_shell_surface_send_configure(event_sink, WL_SHELL_SURFACE_RESIZE_NONE, width, height);
+            }));
     }
 }
 
-class Output
+class WlAbstractMirWindow : public WlMirWindow
 {
 public:
-    Output(
-        wl_display* display,
-        mg::DisplayConfigurationOutput const& initial_configuration)
-        : output{make_output(display)},
-          current_config{initial_configuration}
+    WlAbstractMirWindow(wl_client* client, wl_resource* surface, wl_resource* event_sink,
+        std::shared_ptr<mf::Shell> const& shell) :
+        destroyed{std::make_shared<bool>(false)},
+        client{client},
+        surface{surface},
+        event_sink{event_sink},
+        shell{shell}
     {
     }
 
-    ~Output()
+    ~WlAbstractMirWindow() override
     {
-        wl_global_destroy(output);
+        *destroyed = true;
+        if (surface_id.as_value())
+        {
+            if (auto session = session_for_client(client))
+            {
+                shell->destroy_surface(session, surface_id);
+            }
+
+            surface_id = {};
+        }
     }
 
-    void handle_configuration_changed(mg::DisplayConfigurationOutput const& /*config*/)
-    {
+protected:
+    std::shared_ptr<bool> const destroyed;
+    wl_client* const client;
+    wl_resource* const surface;
+    wl_resource* const event_sink;
+    std::shared_ptr<mf::Shell> const shell;
+    std::shared_ptr<BasicSurfaceEventSink> sink;
 
+    ms::SurfaceCreationParameters params = ms::SurfaceCreationParameters().of_type(mir_window_type_freestyle);
+    mf::SurfaceId surface_id;
+
+    shell::SurfaceSpecification& spec()
+    {
+        if (!pending_changes)
+            pending_changes = std::make_unique<shell::SurfaceSpecification>();
+
+        return *pending_changes;
     }
 
 private:
-    static void send_initial_config(
-        wl_resource* client_resource,
-        mg::DisplayConfigurationOutput const& config)
+    geom::Size latest_buffer_size;
+    std::unique_ptr<shell::SurfaceSpecification> pending_changes;
+
+    void commit() override
     {
-        wl_output_send_geometry(
-            client_resource,
-            config.top_left.x.as_int(),
-            config.top_left.y.as_int(),
-            config.physical_size_mm.width.as_int(),
-            config.physical_size_mm.height.as_int(),
-            WL_OUTPUT_SUBPIXEL_UNKNOWN,
-            "Fake manufacturer",
-            "Fake model",
-            WL_OUTPUT_TRANSFORM_NORMAL);
-        for (size_t i = 0; i < config.modes.size(); ++i)
+        auto const session = session_for_client(client);
+
+        if (surface_id.as_value())
         {
-            auto const& mode = config.modes[i];
-            wl_output_send_mode(
-                client_resource,
-                ((i == config.preferred_mode_index ? WL_OUTPUT_MODE_PREFERRED : 0) |
-                 (i == config.current_mode_index ? WL_OUTPUT_MODE_CURRENT : 0)),
-                mode.size.width.as_int(),
-                mode.size.height.as_int(),
-                mode.vrefresh_hz * 1000);
-        }
-        wl_output_send_scale(client_resource, 1);
-        wl_output_send_done(client_resource);
-    }
+            auto const surface = get_surface_for_id(session, surface_id);
 
-    wl_global* make_output(wl_display* display)
-    {
-        return wl_global_create(
-            display,
-            &wl_output_interface,
-            2,
-            this, &on_bind);
-    }
+            if (surface->size() != latest_buffer_size)
+            {
+                sink->latest_resize(latest_buffer_size);
+                auto& new_size_spec = spec();
+                new_size_spec.width = latest_buffer_size.width;
+                new_size_spec.height = latest_buffer_size.height;
+            }
 
-    static void on_bind(wl_client* client, void* data, uint32_t version, uint32_t id)
-    {
-        auto output = reinterpret_cast<Output*>(data);
-        auto resource = wl_resource_create(client, &wl_output_interface,
-            std::min(version, 2u), id);
-        if (resource == NULL) {
-            wl_client_post_no_memory(client);
+            if (pending_changes)
+                shell->modify_surface(session, surface_id, *pending_changes);
+
+            pending_changes.reset();
             return;
         }
 
-        output->resource_map[client].push_back(resource);
-        wl_resource_set_destructor(resource, &resource_destructor);
-        wl_resource_set_user_data(resource, &(output->resource_map));
+        // Until we've seen a buffer we don't create a surface
+        if (latest_buffer_size == geom::Size{})
+            return;
 
-        send_initial_config(resource, output->current_config);
+        auto* const mir_surface = get_wlsurface(surface);
+        if (params.size == geom::Size{}) params.size = latest_buffer_size;
+        params.content_id = mir_surface->stream_id;
+        surface_id = shell->create_surface(session, params, sink);
+        mir_surface->surface_id = surface_id;
+
+        // The shell isn't guaranteed to respect the requested size
+        auto const window = session->get_surface(surface_id);
+        sink->send_resize(window->client_size());
     }
 
-    static void resource_destructor(wl_resource* resource)
+    void new_buffer_size(geometry::Size const& buffer_size) override
     {
-        auto& map = *reinterpret_cast<decltype(resource_map)*>(
-            wl_resource_get_user_data(resource));
+        latest_buffer_size = buffer_size;
 
-        auto& client_resource_list = map[wl_resource_get_client(resource)];
-        std::remove_if(
-            client_resource_list.begin(),
-            client_resource_list.end(),
-            [resource](auto candidate) { return candidate == resource; });
-    }
-
-private:
-    wl_global* const output;
-    mg::DisplayConfigurationOutput current_config;
-    std::unordered_map<wl_client*, std::vector<wl_resource*>> resource_map;
-};
-
-class OutputManager
-{
-public:
-    OutputManager(
-        wl_display* display,
-        mf::DisplayChanger& display_config)
-        : display{display}
-    {
-        // TODO: Also register display configuration listeners
-        display_config.base_configuration()->for_each_output(std::bind(&OutputManager::create_output, this, std::placeholders::_1));
-    }
-
-private:
-    void create_output(mg::DisplayConfigurationOutput const& initial_config)
-    {
-        if (initial_config.used)
-       {
-            outputs.emplace(
-                initial_config.id,
-                std::make_unique<Output>(
-                    display,
-                    initial_config));
+        // Sometimes, when using xdg-shell, qterminal creates an insanely tall buffer
+        if (latest_buffer_size.height > geometry::Height{10000})
+        {
+            log_warning("Insane buffer height sanitized: latest_buffer_size.height = %d (was %d)",
+                 1000, latest_buffer_size.height.as_int());
+            latest_buffer_size.height = geometry::Height{1000};
         }
     }
 
-    void handle_configuration_change(mg::DisplayConfiguration const& config)
+    void visiblity(bool visible) override
     {
-        config.for_each_output([this](mg::DisplayConfigurationOutput const& output_config)
-            {
-                auto output_iter = outputs.find(output_config.id);
-                if (output_iter != outputs.end())
-                {
-                    if (output_config.used)
-                    {
-                        output_iter->second->handle_configuration_changed(output_config);
-                    }
-                    else
-                    {
-                        outputs.erase(output_iter);
-                    }
-                }
-                else if (output_config.used)
-                {
-                    outputs[output_config.id] = std::make_unique<Output>(display, output_config);
-                }
-            });
-    }
+        if (!surface_id.as_value())
+            return;
 
-    wl_display* const display;
-    std::unordered_map<mg::DisplayConfigurationOutputId, std::unique_ptr<Output>> outputs;
+        auto const session = session_for_client(client);
+
+        if (get_surface_for_id(session, surface_id)->visible() == visible)
+            return;
+
+        spec().state = visible ? mir_window_state_restored : mir_window_state_hidden;
+    }
 };
 
-class WlShellSurface : public wayland::ShellSurface
+class WlShellSurface  : public wayland::ShellSurface, WlAbstractMirWindow
 {
 public:
     WlShellSurface(
@@ -1894,62 +1565,165 @@ public:
         std::shared_ptr<mf::Shell> const& shell,
         WlSeat& seat)
         : ShellSurface(client, parent, id),
-          destroyed{std::make_shared<bool>(false)},
-          shell{shell}
+        WlAbstractMirWindow{client, surface, resource, shell}
     {
-        auto* tmp = wl_resource_get_user_data(surface);
-        auto& mir_surface = *static_cast<WlSurface*>(tmp);
-
-        auto const session = session_for_client(client);
-
-        auto params = ms::SurfaceCreationParameters()
-            .of_type(mir_window_type_freestyle)
-            .of_size(geom::Size{640, 480})
-            .with_buffer_stream(mir_surface.stream_id);
-
-        auto const sink = std::make_shared<SurfaceEventSink>(&seat, client, surface, resource);
-        surface_id = shell->create_surface(session, params, sink);
-
-        {
-            // The shell isn't guaranteed to respect the requested size
-            auto const window = session->get_surface(surface_id);
-            auto const size = window->client_size();
-            sink->latest_resize(size);
-            seat.spawn(
-                run_unless(
-                    destroyed,
-                    [resource=resource, height = size.height.as_int(), width = size.width.as_int()]()
-                    { wl_shell_surface_send_configure(resource, WL_SHELL_SURFACE_RESIZE_NONE, width, height); }));
-        }
-
-        mir_surface.set_resize_handler(
-            [shell, session, id = surface_id, sink](geom::Size new_size)
-            {
-                sink->latest_resize(new_size);
-                shell::SurfaceSpecification new_size_spec;
-                new_size_spec.width = new_size.width;
-                new_size_spec.height = new_size.height;
-                shell->modify_surface(session, id, new_size_spec);
-            });
-
-        mir_surface.set_hide_handler(
-            [shell, session, id = surface_id]()
-            {
-                shell::SurfaceSpecification hide_spec;
-                hide_spec.state = mir_window_state_hidden;
-                shell->modify_surface(session, id, hide_spec);
-            });
+        // We can't pass this to the WlAbstractMirWindow constructor as it needs creating *after* destroyed
+        sink = std::make_shared<SurfaceEventSink>(&seat, client, surface, event_sink, destroyed);
     }
 
     ~WlShellSurface() override
     {
-        *destroyed = true;
-        if (auto session = session_for_client(client))
+        auto* const mir_surface = get_wlsurface(surface);
+        mir_surface->set_role(&nullwlmirwindow);
+    }
+
+protected:
+    void destroy() override
+    {
+        wl_resource_destroy(resource);
+    }
+
+    void set_toplevel() override
+    {
+        auto* const mir_surface = get_wlsurface(surface);
+
+        mir_surface->set_role(this);
+    }
+
+    void set_transient(
+        struct wl_resource* parent,
+        int32_t x,
+        int32_t y,
+        uint32_t flags) override
+    {
+        auto const session = session_for_client(client);
+        auto& parent_surface = *get_wlsurface(parent);
+
+        if (surface_id.as_value())
         {
-            shell->destroy_surface(session, surface_id);
+            auto& mods = spec();
+            mods.parent_id = parent_surface.surface_id;
+            mods.aux_rect = geom::Rectangle{{x, y}, {}};
+            mods.surface_placement_gravity = mir_placement_gravity_northwest;
+            mods.aux_rect_placement_gravity = mir_placement_gravity_southeast;
+            mods.placement_hints = mir_placement_hints_slide_x;
+            mods.aux_rect_placement_offset_x = 0;
+            mods.aux_rect_placement_offset_y = 0;
+        }
+        else
+        {
+            if (flags & WL_SHELL_SURFACE_TRANSIENT_INACTIVE)
+                params.type = mir_window_type_gloss;
+            params.parent_id = parent_surface.surface_id;
+            params.aux_rect = geom::Rectangle{{x, y}, {}};
+            params.surface_placement_gravity = mir_placement_gravity_northwest;
+            params.aux_rect_placement_gravity = mir_placement_gravity_southeast;
+            params.placement_hints = mir_placement_hints_slide_x;
+            params.aux_rect_placement_offset_x = 0;
+            params.aux_rect_placement_offset_y = 0;
+
+            auto* const mir_surface = get_wlsurface(surface);
+            mir_surface->set_role(this);
         }
     }
-protected:
+
+    void set_fullscreen(
+        uint32_t /*method*/,
+        uint32_t /*framerate*/,
+        std::experimental::optional<struct wl_resource*> const& output) override
+    {
+        if (surface_id.as_value())
+        {
+            auto& mods = spec();
+            mods.state = mir_window_state_fullscreen;
+            if (output)
+            {
+                // TODO{alan_g} mods.output_id = DisplayConfigurationOutputId_from(output)
+            }
+        }
+        else
+        {
+            params.state = mir_window_state_fullscreen;
+            if (output)
+            {
+                // TODO{alan_g} params.output_id = DisplayConfigurationOutputId_from(output)
+            }
+        }
+    }
+
+    void set_popup(
+        struct wl_resource* /*seat*/,
+        uint32_t /*serial*/,
+        struct wl_resource* parent,
+        int32_t x,
+        int32_t y,
+        uint32_t flags) override
+    {
+        auto const session = session_for_client(client);
+        auto& parent_surface = *get_wlsurface(parent);
+
+        if (surface_id.as_value())
+        {
+            auto& mods = spec();
+            mods.parent_id = parent_surface.surface_id;
+            mods.aux_rect = geom::Rectangle{{x, y}, {}};
+            mods.surface_placement_gravity = mir_placement_gravity_northwest;
+            mods.aux_rect_placement_gravity = mir_placement_gravity_southeast;
+            mods.placement_hints = mir_placement_hints_slide_x;
+            mods.aux_rect_placement_offset_x = 0;
+            mods.aux_rect_placement_offset_y = 0;
+        }
+        else
+        {
+            if (flags & WL_SHELL_SURFACE_TRANSIENT_INACTIVE)
+                params.type = mir_window_type_gloss;
+
+            params.parent_id = parent_surface.surface_id;
+            params.aux_rect = geom::Rectangle{{x, y}, {}};
+            params.surface_placement_gravity = mir_placement_gravity_northwest;
+            params.aux_rect_placement_gravity = mir_placement_gravity_southeast;
+            params.placement_hints = mir_placement_hints_slide_x;
+            params.aux_rect_placement_offset_x = 0;
+            params.aux_rect_placement_offset_y = 0;
+
+            auto* const mir_surface = get_wlsurface(surface);
+            mir_surface->set_role(this);
+        }
+    }
+
+    void set_maximized(std::experimental::optional<struct wl_resource*> const& output) override
+    {
+        if (surface_id.as_value())
+        {
+            auto& mods = spec();
+            mods.state = mir_window_state_maximized;
+            if (output)
+            {
+                // TODO{alan_g} mods.output_id = DisplayConfigurationOutputId_from(output)
+            }
+        }
+        else
+        {
+            params.state = mir_window_state_maximized;
+            if (output)
+            {
+                // TODO{alan_g} params.output_id = DisplayConfigurationOutputId_from(output)
+            }
+        }
+    }
+
+    void set_title(std::string const& title) override
+    {
+        if (surface_id.as_value())
+        {
+            spec().name = title;
+        }
+        else
+        {
+            params.name = title;
+        }
+    }
+
     void pong(uint32_t /*serial*/) override
     {
     }
@@ -1962,67 +1736,11 @@ protected:
     {
     }
 
-    void set_toplevel() override
-    {
-    }
-
-    void set_transient(
-        struct wl_resource* /*parent*/,
-        int32_t /*x*/,
-        int32_t /*y*/,
-        uint32_t /*flags*/) override
-    {
-    }
-
-    void set_fullscreen(
-        uint32_t /*method*/,
-        uint32_t /*framerate*/,
-        std::experimental::optional<struct wl_resource*> const& output) override
-    {
-        mir::shell::SurfaceSpecification mods;
-        mods.state = mir_window_state_fullscreen;
-        if (output)
-        {
-            // TODO{alan_g} mods.output_id = DisplayConfigurationOutputId_from(output)
-        }
-
-        auto const session = session_for_client(client);
-        shell->modify_surface(session, surface_id, mods);
-    }
-
-    void set_popup(
-        struct wl_resource* /*seat*/,
-        uint32_t /*serial*/,
-        struct wl_resource* /*parent*/,
-        int32_t /*x*/,
-        int32_t /*y*/,
-        uint32_t /*flags*/) override
-    {
-    }
-
-    void set_maximized(std::experimental::optional<struct wl_resource*> const& output) override
-    {
-        mir::shell::SurfaceSpecification mods;
-        mods.state = mir_window_state_maximized;
-        if (output)
-        {
-            // TODO{alan_g} mods.output_id = DisplayConfigurationOutputId_from(output)
-        }
-        auto const session = session_for_client(client);
-        shell->modify_surface(session, surface_id, mods);
-    }
-
-    void set_title(std::string const& /*title*/) override
-    {
-    }
-
     void set_class(std::string const& /*class_*/) override
     {
     }
-private:
-    std::shared_ptr<bool> const destroyed;
-    std::shared_ptr<mf::Shell> const shell;
-    mf::SurfaceId surface_id;
+
+    using WlAbstractMirWindow::client;
 };
 
 class WlShell : public wayland::Shell
@@ -2049,6 +1767,554 @@ public:
 private:
     std::shared_ptr<mf::Shell> const shell;
     WlSeat& seat;
+};
+
+struct XdgPositionerV6 : wayland::XdgPositionerV6
+{
+    XdgPositionerV6(struct wl_client* client, struct wl_resource* parent, uint32_t id) :
+        wayland::XdgPositionerV6(client, parent, id)
+    {
+    }
+
+    void destroy() override
+    {
+        wl_resource_destroy(resource);
+    }
+
+    void set_size(int32_t width, int32_t height) override
+    {
+        size = geom::Size{width, height};
+    }
+
+    void set_anchor_rect(int32_t x, int32_t y, int32_t width, int32_t height) override
+    {
+        aux_rect = geom::Rectangle{{x, y}, {width, height}};
+    }
+
+    void set_anchor(uint32_t anchor) override
+    {
+        MirPlacementGravity placement = mir_placement_gravity_center;
+
+        if (anchor & ZXDG_POSITIONER_V6_ANCHOR_TOP)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_north);
+
+        if (anchor & ZXDG_POSITIONER_V6_ANCHOR_BOTTOM)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_south);
+
+        if (anchor & ZXDG_POSITIONER_V6_ANCHOR_LEFT)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_west);
+
+        if (anchor & ZXDG_POSITIONER_V6_ANCHOR_RIGHT)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_east);
+
+        surface_placement_gravity = placement;
+    }
+
+    void set_gravity(uint32_t gravity) override
+    {
+        MirPlacementGravity placement = mir_placement_gravity_center;
+
+        if (gravity & ZXDG_POSITIONER_V6_GRAVITY_TOP)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_north);
+
+        if (gravity & ZXDG_POSITIONER_V6_GRAVITY_BOTTOM)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_south);
+
+        if (gravity & ZXDG_POSITIONER_V6_GRAVITY_LEFT)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_west);
+
+        if (gravity & ZXDG_POSITIONER_V6_GRAVITY_RIGHT)
+            placement = MirPlacementGravity(placement | mir_placement_gravity_east);
+
+        aux_rect_placement_gravity = placement;
+    }
+
+    void set_constraint_adjustment(uint32_t constraint_adjustment) override
+    {
+        (void)constraint_adjustment;
+        // TODO
+    }
+
+    void set_offset(int32_t x, int32_t y) override
+    {
+        aux_rect_placement_offset_x = x;
+        aux_rect_placement_offset_y = y;
+    }
+
+    optional_value<geometry::Size> size;
+    optional_value<geometry::Rectangle> aux_rect;
+    optional_value<MirPlacementGravity> surface_placement_gravity;
+    optional_value<MirPlacementGravity> aux_rect_placement_gravity;
+    optional_value<int> aux_rect_placement_offset_x;
+    optional_value<int> aux_rect_placement_offset_y;
+};
+
+struct XdgSurfaceV6;
+
+struct XdgToplevelV6 : wayland::XdgToplevelV6
+{
+    XdgToplevelV6(struct wl_client* client, struct wl_resource* parent, uint32_t id,
+        std::shared_ptr<mf::Shell> const& shell, XdgSurfaceV6* self);
+
+    void destroy() override
+    {
+        wl_resource_destroy(resource);
+    }
+
+    void set_parent(std::experimental::optional<struct wl_resource*> const& parent) override;
+
+    void set_title(std::string const& title) override;
+
+    void set_app_id(std::string const& /*app_id*/) override
+    {
+        // Logically this sets the session name, but Mir doesn't allow this (currently) and
+        // allowing e.g. "session_for_client(client)->name(app_id);" would break the libmirserver ABI
+    }
+
+    void show_window_menu(struct wl_resource* seat, uint32_t serial, int32_t x, int32_t y) override
+    {
+        (void)seat, (void)serial, (void)x, (void)y;
+        // TODO
+    }
+
+    void move(struct wl_resource* seat, uint32_t serial) override
+    {
+        (void)seat, (void)serial;
+        // TODO
+    }
+
+    void resize(struct wl_resource* seat, uint32_t serial, uint32_t edges) override
+    {
+        (void)seat, (void)serial, (void)edges;
+        // TODO
+    }
+
+    void set_max_size(int32_t width, int32_t height) override;
+
+    void set_min_size(int32_t width, int32_t height) override;
+
+    void set_maximized() override;
+
+    void unset_maximized() override;
+
+    void set_fullscreen(std::experimental::optional<struct wl_resource*> const& output) override
+    {
+        (void)output;
+        // TODO
+    }
+
+    void unset_fullscreen() override
+    {
+        // TODO
+    }
+
+    void set_minimized() override
+    {
+        // TODO
+    }
+
+private:
+    XdgToplevelV6* get_xdgtoplevel(wl_resource* surface) const
+    {
+        auto* tmp = wl_resource_get_user_data(surface);
+        return static_cast<XdgToplevelV6*>(static_cast<wayland::XdgToplevelV6*>(tmp));
+    }
+
+    std::shared_ptr<mf::Shell> const shell;
+    XdgSurfaceV6* const self;
+};
+
+struct XdgPopupV6 : wayland::XdgPopupV6
+{
+    XdgPopupV6(struct wl_client* client, struct wl_resource* parent, uint32_t id) :
+        wayland::XdgPopupV6(client, parent, id)
+    {
+    }
+
+    void grab(struct wl_resource* seat, uint32_t serial) override
+    {
+        (void)seat, (void)serial;
+        // TODO
+    }
+
+    void destroy() override
+    {
+        wl_resource_destroy(resource);
+    }
+};
+
+class XdgSurfaceV6EventSink : public BasicSurfaceEventSink
+{
+public:
+    using BasicSurfaceEventSink::BasicSurfaceEventSink;
+
+    XdgSurfaceV6EventSink(WlSeat* seat, wl_client* client, wl_resource* target, wl_resource* event_sink,
+        std::shared_ptr<bool> const& destroyed) :
+        BasicSurfaceEventSink(seat, client, target, event_sink),
+        destroyed{destroyed}
+    {
+        auto const serial = wl_display_next_serial(wl_client_get_display(client));
+        post_configure(serial);
+    }
+
+    void send_resize(geometry::Size const& new_size) const override
+    {
+        if (window_size != new_size)
+        {
+            auto const serial = wl_display_next_serial(wl_client_get_display(client));
+            notify_resize(new_size);
+            post_configure(serial);
+        }
+    }
+
+    std::function<void(geometry::Size const& new_size)> notify_resize = [](auto){};
+
+private:
+    void post_configure(int serial) const
+    {
+        seat->spawn(run_unless(destroyed, [event_sink= event_sink, serial]()
+            {
+                wl_resource_post_event(event_sink, 0, serial);
+            }));
+    }
+
+    std::shared_ptr<bool> const destroyed;
+};
+
+struct XdgSurfaceV6 : wayland::XdgSurfaceV6, WlAbstractMirWindow
+{
+    XdgSurfaceV6* get_xdgsurface(wl_resource* surface) const
+    {
+        auto* tmp = wl_resource_get_user_data(surface);
+        return static_cast<XdgSurfaceV6*>(static_cast<wayland::XdgSurfaceV6*>(tmp));
+    }
+
+    XdgSurfaceV6(wl_client* client,
+        wl_resource* parent,
+        uint32_t id,
+        wl_resource* surface,
+        std::shared_ptr<mf::Shell> const& shell,
+        WlSeat& seat) :
+        wayland::XdgSurfaceV6(client, parent, id),
+        WlAbstractMirWindow{client, surface, resource, shell},
+        parent{parent},
+        shell{shell},
+        sink{std::make_shared<XdgSurfaceV6EventSink>(&seat, client, surface, resource, destroyed)}
+    {
+        WlAbstractMirWindow::sink = sink;
+    }
+
+    ~XdgSurfaceV6() override
+    {
+        auto* const mir_surface = get_wlsurface(surface);
+        mir_surface->set_role(&nullwlmirwindow);
+    }
+
+    void destroy() override
+    {
+        wl_resource_destroy(resource);
+    }
+
+    void get_toplevel(uint32_t id) override
+    {
+        new XdgToplevelV6{client, parent, id, shell, this};
+        auto* const mir_surface = get_wlsurface(surface);
+        mir_surface->set_role(this);
+    }
+
+    void get_popup(uint32_t id, struct wl_resource* parent, struct wl_resource* positioner) override
+    {
+        auto* tmp = wl_resource_get_user_data(positioner);
+        auto const* const pos =  static_cast<XdgPositionerV6*>(static_cast<wayland::XdgPositionerV6*>(tmp));
+
+        auto const session = session_for_client(client);
+        auto& parent_surface = *get_xdgsurface(parent);
+
+        params.type = mir_window_type_freestyle;
+        params.parent_id = parent_surface.surface_id;
+        if (pos->size.is_set()) params.size = pos->size.value();
+        params.aux_rect = pos->aux_rect;
+        params.surface_placement_gravity = pos->surface_placement_gravity;
+        params.aux_rect_placement_gravity = pos->aux_rect_placement_gravity;
+        params.aux_rect_placement_offset_x = pos->aux_rect_placement_offset_x;
+        params.aux_rect_placement_offset_y = pos->aux_rect_placement_offset_y;
+        params.placement_hints = mir_placement_hints_slide_any;
+
+        new XdgPopupV6{client, parent, id};
+        auto* const mir_surface = get_wlsurface(surface);
+        mir_surface->set_role(this);
+    }
+
+    void set_window_geometry(int32_t x, int32_t y, int32_t width, int32_t height) override
+    {
+        geom::Rectangle const input_region{{x, y}, {width, height}};
+
+        if (surface_id.as_value())
+        {
+            spec().input_shape = {input_region};
+        }
+        else
+        {
+            params.input_shape = {input_region};
+        }
+    }
+
+    void ack_configure(uint32_t serial) override
+    {
+        (void)serial;
+        // TODO
+    }
+
+    void set_parent(optional_value<SurfaceId> parent_id);
+    void set_title(std::string const& title);
+    void set_max_size(int32_t width, int32_t height);
+    void set_min_size(int32_t width, int32_t height);
+    void set_maximized();
+    void unset_maximized();
+
+    using WlAbstractMirWindow::client;
+    using WlAbstractMirWindow::params;
+    using WlAbstractMirWindow::surface_id;
+    struct wl_resource* const parent;
+    std::shared_ptr<mf::Shell> const shell;
+    std::shared_ptr<XdgSurfaceV6EventSink> const sink;
+};
+
+XdgToplevelV6::XdgToplevelV6(struct wl_client* client, struct wl_resource* parent, uint32_t id,
+    std::shared_ptr<mf::Shell> const& shell, XdgSurfaceV6* self) :
+    wayland::XdgToplevelV6(client, parent, id),
+    shell{shell},
+    self{self}
+{
+    self->sink->notify_resize = [this](geom::Size const& new_size)
+        {
+            wl_array states;
+            wl_array_init(&states);
+
+            zxdg_toplevel_v6_send_configure(resource, new_size.width.as_int(), new_size.height.as_int(), &states);
+        };
+}
+
+
+void XdgSurfaceV6::set_title(std::string const& title)
+{
+    if (surface_id.as_value())
+    {
+        spec().name = title;
+    }
+    else
+    {
+        params.name = title;
+    }
+}
+
+
+void XdgSurfaceV6::set_parent(optional_value<SurfaceId> parent_id)
+{
+    if (surface_id.as_value())
+    {
+        spec().parent_id = parent_id;
+    }
+    else
+    {
+        params.parent_id = parent_id;
+    }
+}
+
+void XdgSurfaceV6::set_max_size(int32_t width, int32_t height)
+{
+    if (surface_id.as_value())
+    {
+        if (width == 0) width = std::numeric_limits<int>::max();
+        if (height == 0) height = std::numeric_limits<int>::max();
+
+        auto& mods = spec();
+        mods.max_width = geom::Width{width};
+        mods.max_height = geom::Height{height};
+    }
+    else
+    {
+        if (width == 0)
+        {
+            if (params.max_width.is_set())
+                params.max_width.consume();
+        }
+        else
+            params.max_width = geom::Width{width};
+
+        if (height == 0)
+        {
+            if (params.max_height.is_set())
+                params.max_height.consume();
+        }
+        else
+            params.max_height = geom::Height{height};
+    }
+}
+
+void XdgSurfaceV6::set_min_size(int32_t width, int32_t height)
+{
+    if (surface_id.as_value())
+    {
+        auto& mods = spec();
+        mods.min_width = geom::Width{width};
+        mods.min_height = geom::Height{height};
+    }
+    else
+    {
+        params.min_width = geom::Width{width};
+        params.min_height = geom::Height{height};
+    }
+}
+
+void XdgSurfaceV6::set_maximized()
+{
+    if (surface_id.as_value())
+    {
+        spec().state = mir_window_state_maximized;
+    }
+    else
+    {
+        params.state = mir_window_state_maximized;
+    }
+}
+
+void XdgSurfaceV6::unset_maximized()
+{
+    if (surface_id.as_value())
+    {
+        spec().state = mir_window_state_restored;
+    }
+    else
+    {
+        params.state = mir_window_state_restored;
+    }
+}
+
+
+void XdgToplevelV6::set_parent(std::experimental::optional<struct wl_resource*> const& parent)
+{
+    if (parent && parent.value())
+    {
+        self->set_parent(get_xdgtoplevel(parent.value())->self->surface_id);
+    }
+    else
+    {
+        self->set_parent({});
+    }
+
+}
+
+void XdgToplevelV6::set_title(std::string const& title)
+{
+    self->set_title(title);
+}
+
+void XdgToplevelV6::set_max_size(int32_t width, int32_t height)
+{
+    self->set_max_size(width, height);
+}
+
+void XdgToplevelV6::set_min_size(int32_t width, int32_t height)
+{
+    self->set_min_size(width, height);
+}
+
+void XdgToplevelV6::set_maximized()
+{
+    self->set_maximized();
+}
+
+void XdgToplevelV6::unset_maximized()
+{
+    self->unset_maximized();
+}
+
+struct XdgShellV6 : wayland::XdgShellV6
+{
+    XdgShellV6(
+        struct wl_display* display,
+        std::shared_ptr<mf::Shell> const shell,
+        WlSeat& seat) :
+        wayland::XdgShellV6(display, 1),
+        shell{shell},
+        seat{seat}
+    {
+    }
+
+    void destroy(struct wl_client* client, struct wl_resource* resource) override
+    {
+        (void)client, (void)resource;
+        // TODO
+    }
+
+    void create_positioner(struct wl_client* client, struct wl_resource* resource, uint32_t id) override
+    {
+        new XdgPositionerV6{client, resource, id};
+    }
+
+    void get_xdg_surface(
+        struct wl_client* client,
+        struct wl_resource* resource,
+        uint32_t id,
+        struct wl_resource* surface) override
+    {
+        new XdgSurfaceV6{client, resource, id, surface, shell, seat};
+    }
+
+    void pong(struct wl_client* client, struct wl_resource* resource, uint32_t serial) override
+    {
+        (void)client, (void)resource, (void)serial;
+        // TODO
+    }
+
+private:
+    std::shared_ptr<mf::Shell> const shell;
+    WlSeat& seat;
+};
+
+struct DataDevice : wayland::DataDevice
+{
+    DataDevice(struct wl_client* client, struct wl_resource* parent, uint32_t id) :
+        wayland::DataDevice(client, parent, id)
+    {
+    }
+
+    void start_drag(
+        std::experimental::optional<struct wl_resource*> const& source, struct wl_resource* origin,
+        std::experimental::optional<struct wl_resource*> const& icon, uint32_t serial) override
+    {
+        (void)source, (void)origin, (void)icon, (void)serial;
+    }
+
+    void set_selection(std::experimental::optional<struct wl_resource*> const& source, uint32_t serial) override
+    {
+        (void)source, (void)serial;
+    }
+
+    void release() override
+    {
+    }
+};
+
+struct DataDeviceManager : wayland::DataDeviceManager
+{
+    DataDeviceManager(struct wl_display* display) :
+        wayland::DataDeviceManager(display, 3)
+    {
+    }
+
+    void create_data_source(struct wl_client* client, struct wl_resource* resource, uint32_t id) override
+    {
+        (void)client, (void)resource, (void)id;
+    }
+
+    void get_data_device(
+        struct wl_client* client, struct wl_resource* resource, uint32_t id, struct wl_resource* seat) override
+    {
+        (void)seat;
+        new DataDevice{client, resource, id};
+    }
 };
 }
 }
@@ -2079,142 +2345,6 @@ void cleanup_display(wl_display *display)
     wl_display_flush_clients(display);
     wl_display_destroy(display);
 }
-
-class WaylandExecutor : public mir::Executor
-{
-public:
-    void spawn (std::function<void ()>&& work) override
-    {
-        {
-            std::lock_guard<std::recursive_mutex> lock{mutex};
-            workqueue.emplace_back(std::move(work));
-        }
-        if (auto err = eventfd_write(notify_fd, 1))
-        {
-            BOOST_THROW_EXCEPTION((std::system_error{err, std::system_category(), "eventfd_write failed to notify event loop"}));
-        }
-    }
-
-    /**
-     * Get an Executor which dispatches onto a wl_event_loop
-     *
-     * \note    The executor may outlive the wl_event_loop, but no tasks will be dispatched
-     *          after the wl_event_loop is destroyed.
-     *
-     * \param [in]  loop    The event loop to dispatch on
-     * \return              An Executor that queues onto the wl_event_loop
-     */
-    static std::shared_ptr<mir::Executor> executor_for_event_loop(wl_event_loop* loop)
-    {
-        if (auto notifier = wl_event_loop_get_destroy_listener(loop, &on_display_destruction))
-        {
-            DestructionShim* shim;
-            shim = wl_container_of(notifier, shim, destruction_listener);
-
-            return shim->executor;
-        }
-        else
-        {
-            auto const executor = std::shared_ptr<WaylandExecutor>{new WaylandExecutor{loop}};
-            auto shim = std::make_unique<DestructionShim>(executor);
-
-            shim->destruction_listener.notify = &on_display_destruction;
-            wl_event_loop_add_destroy_listener(loop, &(shim.release())->destruction_listener);
-
-            return executor;
-        }
-    }
-
-private:
-    WaylandExecutor(wl_event_loop* loop)
-        : notify_fd{eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK)},
-          notify_source{wl_event_loop_add_fd(loop, notify_fd, WL_EVENT_READABLE, &on_notify, this)}
-    {
-        if (notify_fd == mir::Fd::invalid)
-        {
-            BOOST_THROW_EXCEPTION((std::system_error{
-                errno,
-                std::system_category(),
-                "Failed to create IPC pause notification eventfd"}));
-        }
-    }
-
-    std::function<void()> get_work()
-    {
-        std::lock_guard<std::recursive_mutex> lock{mutex};
-        if (!workqueue.empty())
-        {
-            auto const work = std::move(workqueue.front());
-            workqueue.pop_front();
-            return work;
-        }
-        return {};
-    }
-
-    static int on_notify(int fd, uint32_t, void* data)
-    {
-        auto executor = static_cast<WaylandExecutor*>(data);
-
-        eventfd_t unused;
-        if (auto err = eventfd_read(fd, &unused))
-        {
-            mir::log_error(
-                "eventfd_read failed to consume wakeup notification: %s (%i)",
-                strerror(err),
-                err);
-        }
-
-        while (auto work = executor->get_work())
-        {
-            try
-            {
-                work();
-            }
-            catch(...)
-            {
-                mir::log(
-                    mir::logging::Severity::critical,
-                    MIR_LOG_COMPONENT,
-                    std::current_exception(),
-                    "Exception processing Wayland event loop work item");
-            }
-        }
-
-        return 0;
-    }
-
-    static void on_display_destruction(wl_listener* listener, void*)
-    {
-        DestructionShim* shim;
-        shim = wl_container_of(listener, shim, destruction_listener);
-
-        {
-            std::lock_guard<std::recursive_mutex> lock{shim->executor->mutex};
-            wl_event_source_remove(shim->executor->notify_source);
-        }
-        delete shim;
-    }
-
-    std::recursive_mutex mutex;
-    mir::Fd const notify_fd;
-    std::deque<std::function<void()>> workqueue;
-
-    wl_event_source* const notify_source;
-
-    struct DestructionShim
-    {
-        explicit DestructionShim(std::shared_ptr<WaylandExecutor> const& executor)
-            : executor{executor}
-        {
-        }
-
-        std::shared_ptr<WaylandExecutor> const executor;
-        wl_listener destruction_listener;
-    };
-    static_assert(
-        std::is_standard_layout<DestructionShim>::value,
-        "DestructionShim must be Standard Layout for wl_container_of to be defined behaviour");
-};
 }
 
 mf::WaylandConnector::WaylandConnector(
@@ -2222,6 +2352,7 @@ mf::WaylandConnector::WaylandConnector(
     std::shared_ptr<mf::Shell> const& shell,
     DisplayChanger& display_config,
     std::shared_ptr<mi::InputDeviceHub> const& input_hub,
+    std::shared_ptr<mi::Seat> const& seat,
     std::shared_ptr<mg::GraphicBufferAllocator> const& allocator,
     std::shared_ptr<mf::SessionAuthorizer> const& session_authorizer,
     bool arw_socket)
@@ -2251,17 +2382,22 @@ mf::WaylandConnector::WaylandConnector(
      * So far I've only found ones which expect wl_compositor before anything else,
      * so stick that first.
      */
-    auto const executor = WaylandExecutor::executor_for_event_loop(wl_display_get_event_loop(display.get()));
+    auto const executor = executor_for_event_loop(wl_display_get_event_loop(display.get()));
 
     compositor_global = std::make_unique<mf::WlCompositor>(
         display.get(),
         executor,
         this->allocator);
-    seat_global = std::make_unique<mf::WlSeat>(display.get(), input_hub, executor);
+    seat_global = std::make_unique<mf::WlSeat>(display.get(), input_hub, seat, executor);
     output_manager = std::make_unique<mf::OutputManager>(
         display.get(),
         display_config);
     shell_global = std::make_unique<mf::WlShell>(display.get(), shell, *seat_global);
+    data_device_manager_global = std::make_unique<DataDeviceManager>(display.get());
+
+    // The XDG shell support is currently too flaky to enable by default
+    if (getenv("MIR_EXPERIMENTAL_XDG_SHELL"))
+        xdg_shell_global = std::make_unique<XdgShellV6>(display.get(), shell, *seat_global);
 
     wl_display_init_shm(display.get());
 
@@ -2349,9 +2485,21 @@ int mf::WaylandConnector::client_socket_fd() const
     {
         error = "Could not create socket pair";
     }
-    else if (!wl_client_create(display.get(), socket_fd[server]))
+    else
     {
-        error = "Failed to add server end of socketpair to Wayland display";
+        // TODO: Wait on the result of wl_client_create so we can throw an exception on failure.
+        executor_for_event_loop(wl_display_get_event_loop(display.get()))
+            ->spawn(
+                [socket = socket_fd[server], display = display.get()]()
+                {
+                    if (!wl_client_create(display, socket))
+                    {
+                        mir::log_error(
+                            "Failed to create Wayland client object: %s (errno %i)",
+                            strerror(errno),
+                            errno);
+                    }
+                });
     }
 
     if (error)
@@ -2368,7 +2516,7 @@ int mf::WaylandConnector::client_socket_fd(
 
 void mf::WaylandConnector::run_on_wayland_display(std::function<void(wl_display*)> const& functor)
 {
-    auto executor = WaylandExecutor::executor_for_event_loop(wl_display_get_event_loop(display.get()));
+    auto executor = executor_for_event_loop(wl_display_get_event_loop(display.get()));
 
     executor->spawn([display_ref = display.get(), functor]() { functor(display_ref); });
 }

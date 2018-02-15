@@ -73,6 +73,9 @@ private:
 
     void surface_removed(scene::Surface* surface);
 
+    void surface_moved(scene::Surface* moved_surface);
+    void surface_resized();
+
     // Look in to homognizing index on KeyInputState and PointerInputState (wrt to device id)
     struct PointerInputState
     {
@@ -94,6 +97,7 @@ private:
     std::shared_ptr<scene::Observer> scene_observer;
 
     std::mutex dispatcher_mutex;
+    std::shared_ptr<MirEvent const> last_pointer_event;
     std::weak_ptr<input::Surface> focus_surface;
     std::vector<uint8_t> drag_and_drop_handle;
     bool started;

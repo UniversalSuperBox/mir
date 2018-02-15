@@ -9,7 +9,7 @@ if [ -n "${MIR_SOCKET}" ]
 then
   if [ ! -e "${MIR_SOCKET}" ]
   then
-    echo "Error: Host endpoint '${MIR_SOCKET}' does not exists"; exit 1
+    echo "Error: Host endpoint '${MIR_SOCKET}' does not exist"; exit 1
   fi
   hostsocket='--host-socket ${MIR_SOCKET}'
 fi
@@ -30,14 +30,14 @@ do
     echo "    -wayland-socket-name <socket> set the wayland socket [${wayland_display}]"
     echo "    -bindir <bindir>              path to the miral executable [${bindir}]"
     exit 0
-    elif [ "$1" == "-kiosk" ];              then miral_server=miral-kiosk
-    elif [ "$1" == "-launcher" ];           then shift; launcher=$1
-    elif [ "$1" == "-socket" ];             then shift; socket=$1
-    elif [ "$1" == "-wayland-socket-name" ];then shift; wayland_display=$1
-    elif [ "$1" == "-bindir" ];             then shift; bindir=$1
-    elif [ "${1:0:2}" == "--" ];            then break
-    fi
-    shift
+  elif [ "$1" == "-kiosk" ];              then miral_server=miral-kiosk
+  elif [ "$1" == "-launcher" ];           then shift; launcher=$1
+  elif [ "$1" == "-socket" ];             then shift; socket=$1
+  elif [ "$1" == "-wayland-socket-name" ];then shift; wayland_display=$1
+  elif [ "$1" == "-bindir" ];             then shift; bindir=$1
+  elif [ "${1:0:2}" == "--" ];            then break
+  fi
+  shift
 done
 
 if [ "${bindir}" != "" ]; then bindir="${bindir}/"; fi
@@ -45,20 +45,12 @@ if [ "${bindir}" != "" ]; then bindir="${bindir}/"; fi
 if [ -e "${socket}" ]; then echo "Error: session endpoint '${socket}' already exists"; exit 1 ;fi
 if [ -e "${XDG_RUNTIME_DIR}/${wayland_display}" ]; then echo "Error: wayland endpoint '${wayland_display}' already exists"; exit 1 ;fi
 
-qt_qpa_platform=ubuntumirclient
-qtubuntu_desktop_installed=$(apt list qtubuntu-desktop 2>/dev/null | grep installed | wc -l)
-if [ "${qtubuntu_desktop_installed}" == "0" ]
-then
-    echo "** Warning ** defaulting to Wayland backend for Qt"
-    echo "For the best experience install qtubuntu-desktop - run \"sudo apt install qtubuntu-desktop\""
-    qt_qpa_platform=wayland
-fi
 
 sh -c "${bindir}${miral_server} $* ${hostsocket} --file ${socket} --wayland-socket-name ${wayland_display} --desktop_file_hint=miral-shell.desktop"&
 
 while [ ! -e "${socket}" ]; do echo "waiting for ${socket}"; sleep 1 ;done
 
 unset QT_QPA_PLATFORMTHEME
-MIR_SOCKET=${socket} XDG_SESSION_TYPE=mir GDK_BACKEND=mir QT_QPA_PLATFORM=${qt_qpa_platform} SDL_VIDEODRIVER=wayland WAYLAND_DISPLAY=${wayland_display} dbus-run-session -- ${launcher}
-killall ${bindir}${miral_server}
+MIR_SOCKET=${socket} XDG_SESSION_TYPE=mir GDK_BACKEND=wayland,mir QT_QPA_PLATFORM=wayland SDL_VIDEODRIVER=wayland WAYLAND_DISPLAY=${wayland_display} dbus-run-session -- ${launcher}
+killall ${bindir}${miral_server} || killall ${bindir}${miral_server}.bin
 
