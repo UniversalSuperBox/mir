@@ -36,7 +36,7 @@ public:
 private:
     geometry::Rectangle const view_area;
     bool bypass_is_feasible;
-    glm::mat4 const identity;
+    glm::mat4 identity;
 };
 
 } // namespace mesa

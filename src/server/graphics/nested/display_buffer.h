@@ -88,7 +88,7 @@ private:
         stream,
         chain
     } content;
-    glm::mat4 const identity;
+    glm::mat4 identity;
 
     std::mutex mutex;
     typedef std::tuple<MirBuffer*, MirPresentationChain*> SubmissionInfo;
